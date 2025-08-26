@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Custom Car-Part Detector (TF.js)</title>
+  <style>
+    body { font-family: system-ui, Arial; }
+    #wrap { display:flex; gap:20px; align-items:flex-start; }
+    canvas { border:1px solid #ddd; max-width: 90vw; height:auto; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4"></script>
+</head>
+<body>
+  <h2>Custom Car-Part Detector</h2>
+  <input type="file" id="file" accept="image/*" />
+  <div id="status">Loading model…</div>
+  <div id="wrap">
+    <canvas id="canvas"></canvas>
+    <pre id="log"></pre>
+  </div>
+
+  <script>
+    // EDIT: keep this in sync with your data.yaml
+    const CLASS_NAMES = [
+      "piston","camshaft","crankshaft","flywheel","spark_plug","valve","oil_pan"
+    ];
+
+    let model;
+    const inputSize = 640; // must match export size
+    const scoreThresh = 0.25;
+    const iouThresh = 0.45;
+
+    (async () => {
+      model = await tf.loadGraphModel("./web_model/model.json");
+      document.getElementById('status').textContent = "Model ready. Upload an image.";
+    })();
+
+    document.getElementById('file').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file || !model) return;
+
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      img.onload = async () => {
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+
+        // Preprocess: letterbox to square inputSize
+        const [inputTensor, scale, dx, dy] = await preprocess(img, inputSize);
+
+        // Inference
+        const output = await model.executeAsync(inputTensor);
+
+        // Inspect shapes first time to adjust parser if needed
+        console.log('Output:', output);
+
+        // Postprocess (YOLOv8-like)
+        const dets = await decodeDetections(output, scale, dx, dy, img.width, img.height);
+
+        // Draw
+        drawDetections(ctx, dets);
+
+        document.getElementById('log').textContent =
+          JSON.stringify(dets.slice(0, 50), null, 2);
+
+        // Cleanup
+        tf.dispose([inputTensor, output]);
+        URL.revokeObjectURL(img.src);
+      };
+    });
+
+    async function preprocess(img, size) {
+      // Letterbox to square without distortion
+      const oc = document.createElement('canvas');
+      oc.width = size; oc.height = size;
+      const octx = oc.getContext('2d');
+
+      const r = Math.min(size / img.width, size / img.height);
+      const newW = Math.round(img.width * r);
+      const newH = Math.round(img.height * r);
+      const dx = Math.floor((size - newW) / 2);
+      const dy = Math.floor((size - newH) / 2);
+
+      octx.fillStyle = 'black';
+      octx.fillRect(0, 0, size, size);
+      octx.drawImage(img, dx, dy, newW, newH);
+
+      const data = octx.getImageData(0, 0, size, size);
+      const input = tf.tidy(() =>
+        tf.tensor(data.data, [size, size, 4])
+          .slice([0,0,0],[size,size,3])
+          .toFloat()
+          .div(255.0)
+          .expandDims(0)
+      );
+      return [input, r, dx, dy];
+    }
+
+    async function decodeDetections(output, scale, dx, dy, origW, origH) {
+      // Adjust this based on actual output signature.
+      // Common YOLOv8 TF exports: [1, N, 84] or [1, 84, N].
+      // Boxes are cx,cy,w,h; classes start at 4.
+      let t = Array.isArray(output) ? output[0] : output;
+      t = t.squeeze(); // -> [N, 84] or [84, N]
+      if (t.shape[0] === 84) t = t.transpose(); // -> [N, 84]
+
+      const data = await t.array();
+      const boxes = [];
+      for (const row of data) {
+        const [cx, cy, w, h, ...scores] = row;
+        const conf = Math.max(...scores);
+        const cls = scores.indexOf(conf);
+        if (conf < scoreThresh) continue;
+
+        // cx,cy,w,h in letterboxed space -> xyxy in original image space
+        const x = (cx - w / 2 - dx) / scale;
+        const y = (cy - h / 2 - dy) / scale;
+        const x2 = (cx + w / 2 - dx) / scale;
+        const y2 = (cy + h / 2 - dy) / scale;
+
+        // clip
+        const x1c = Math.max(0, Math.min(origW, x));
+        const y1c = Math.max(0, Math.min(origH, y));
+        const x2c = Math.max(0, Math.min(origW, x2));
+        const y2c = Math.max(0, Math.min(origH, y2));
+
+        boxes.push({
+          bbox: [x1c, y1c, x2c - x1c, y2c - y1c],
+          score: conf,
+          classId: cls,
+          label: CLASS_NAMES[cls] ?? `cls_${cls}`
+        });
+      }
+
+      // NMS
+      return nonMaxSuppression(boxes, iouThresh);
+    }
+
+    function nonMaxSuppression(dets, iouThresh) {
+      dets.sort((a,b)=> b.score - a.score);
+      const keep = [];
+      for (const d of dets) {
+        let shouldKeep = true;
+        for (const k of keep) {
+          if (iou(d.bbox, k.bbox) > iouThresh &&
+              d.classId === k.classId) { shouldKeep = false; break; }
+        }
+        if (shouldKeep) keep.push(d);
+      }
+      return keep;
+    }
+
+    function iou(a, b) {
+      const [ax, ay, aw, ah] = a;
+      const [bx, by, bw, bh] = b;
+      const x1 = Math.max(ax, bx);
+      const y1 = Math.max(ay, by);
+      const x2 = Math.min(ax+aw, bx+bw);
+      const y2 = Math.min(ay+ah, by+bh);
+      const inter = Math.max(0, x2-x1) * Math.max(0, y2-y1);
+      const ua = aw*ah + bw*bh - inter;
+      return ua <= 0 ? 0 : inter / ua;
+    }
+
+    function drawDetections(ctx, dets) {
+      ctx.lineWidth = 2;
+      ctx.font = "16px system-ui";
+      dets.forEach(d => {
+        const [x,y,w,h] = d.bbox;
+        ctx.strokeStyle = "red";
+        ctx.strokeRect(x,y,w,h);
+        ctx.fillStyle = "red";
+        const txt = `${d.label} ${(d.score*100).toFixed(1)}%`;
+        ctx.fillText(txt, x, Math.max(12, y-4));
+      });
+    }
+  </script>
+</body>
+</html>
